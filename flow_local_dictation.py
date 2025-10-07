@@ -1,7 +1,5 @@
-import os, subprocess, time, threading, queue, datetime
-import sys
-import shutil
-import tempfile, uuid
+import os, subprocess, time, threading, queue, datetime, shlex
+import sys, shutil, tempfile, uuid
 import sounddevice as sd
 import soundfile as sf
 import keyboard
@@ -14,6 +12,16 @@ import numpy as np
 from PIL import Image
 import pystray
 import re
+
+# Enable CUDA by default unless explicitly disabled via environment
+os.environ.setdefault("GGML_CUDA_ENABLE", "1")
+os.environ.setdefault("FLOW_WHISPER_BIN", r"C:\\Users\\isaia\\whisper.cpp\\build\\bin\\Release\\main.exe")
+os.environ.setdefault("WHISPER_BIN", os.environ["FLOW_WHISPER_BIN"])
+os.environ.setdefault("FLOW_WHISPER_ARGS", "-ngl 99")
+
+_bin = os.environ.get("FLOW_WHISPER_BIN")
+if _bin and not os.path.isfile(_bin):
+    raise FileNotFoundError(f"FLOW_WHISPER_BIN not found: {_bin}")
 
 # Prefer winotify for reliable Windows 10/11 notifications; fall back gracefully if unavailable
 try:
@@ -40,7 +48,7 @@ _acquire_single_instance()
 
 # --- Config ---
 MODEL_PATH_REL = os.path.join("models", "ggml-large-v3.bin")  # upgraded model for better accuracy
-WHISPER_BIN = os.path.join(".", "whisper-cli.exe")       # whisper.cpp CLI binary
+WHISPER_BIN = os.environ.get("WHISPER_BIN") or os.path.join(".", "main.exe")
 SAMPLE_RATE = 16000
 CHANNELS = 1
 WAV_TMP = "flow_input.wav"
@@ -467,6 +475,39 @@ def startup_diagnostics():
         log_line("Diagnostics OK")
         log_line("Available input devices:\n" + devices_summary_text())
 
+
+def _resolve_whisper_exe(bin_path: str) -> str:
+    """Resolve path to whisper binary, preferring env, then given path, then PATH, then known locations."""
+    for key in ("FLOW_WHISPER_BIN", "WHISPER_BIN"):
+        p = os.getenv(key)
+        if p and os.path.isfile(p):
+            return p
+    # Accept explicit path (absolute or relative)
+    if bin_path and os.path.isfile(bin_path):
+        return bin_path
+    w = shutil.which("main.exe") or shutil.which("whisper-cli.exe")
+    if w:
+        return w
+    for p in (
+        r"C:\\Users\\isaia\\whisper.cpp\\build\\bin\\Release\\main.exe",
+        r"C:\\Users\\isaia\\whisper.cpp\\build\\bin\\Release\\whisper-cli.exe",
+    ):
+        if os.path.isfile(p):
+            return p
+    raise FileNotFoundError("Whisper binary not found (env, PATH, or known locations).")
+
+def build_whisper_cmd(exe, model_path, wav_path, base_args=None):
+    base_args = base_args or []
+    extra_args = shlex.split(os.getenv("FLOW_WHISPER_ARGS", ""))
+
+    # The legacy whisper-cli.exe does not accept GPU layer args like -ngl
+    if os.path.basename(exe).lower() == "whisper-cli.exe":
+        extra_args = [a for a in extra_args if a not in ("-ngl", "--n-gpu-layers")]
+        return [exe, "-m", model_path, *base_args, *extra_args, wav_path]
+
+    # main.exe accepts -f <wav>
+    return [exe, "-m", model_path, "-f", wav_path, *base_args, *extra_args]
+
 MIN_SEC = 0.4           # require at least 0.4s of voiced audio
 RMS_THRESH = 0.005      # adjust to taste
 PREROLL_SEC  = 2.0      # reserved: pre-roll buffer window (if trimming logic is added)
@@ -612,8 +653,9 @@ def start_recording():
     rec_thread.start()
 
 def run_whisper(filename, bin_path):
-    # Ensure DLLs are found: run in the binary’s directory
-    workdir = os.path.dirname(os.path.abspath(bin_path)) or "."
+    # Resolve executable and ensure DLLs are found by running in its directory
+    exe = os.path.abspath(_resolve_whisper_exe(bin_path))
+    workdir = os.path.dirname(exe) or "."
 
     # Output transcript file in temp directory
     out_txt = os.path.join(tempfile.gettempdir(), f"flow_out_{uuid.uuid4().hex}.txt")
@@ -638,19 +680,20 @@ def run_whisper(filename, bin_path):
 
     # Threading and optional accuracy mode for long dictations
     num_threads = str(os.cpu_count() or 4)
-
-    cmd = [
-        bin_path,
-        "-m", MODEL_PATH,
-        "-f", filename,
-        "-l", "en",
-        "-nt",
-        "-mc", "0",          # full context
-        "-bs", "5",          # base beam size
-        "-t",  num_threads,   # all cores
-        "-nfa",               # disable flash-attn for stability
-        "-otxt", "-of", out_txt[:-4],
-    ]
+    cmd = build_whisper_cmd(
+        exe,
+        MODEL_PATH,
+        filename,
+        base_args=[
+            "-l", "en",
+            "-nt",
+            "-mc", "0",
+            "-bs", "5",
+            "-t", num_threads,
+            "-nfa",
+            "-otxt", "-of", out_txt[:-4],
+        ],
+    )
 
     # Optional accuracy mode for long dictations (>15s)
     try:
@@ -670,6 +713,9 @@ def run_whisper(filename, bin_path):
 
     env = os.environ.copy()
     env["GGML_CUDA_FORCE_CUBLAS"] = "1"   # avoid flash-attn kernel assert on RTX 20-series
+    log_line(f"DEBUG exe = {exe}")
+    log_line(f"DEBUG wav_path = {filename}")
+    log_line(f"DEBUG cmd = {cmd}")
 
     res = subprocess.run(
         cmd,
@@ -686,10 +732,12 @@ def run_whisper(filename, bin_path):
 
     if res.returncode != 0 or _looks_cuda_assert(res.stderr):
         safe_print("[whisper] CUDA failed; retrying on CPU")
-        cmd_cpu = [
-            bin_path, "-m", MODEL_PATH, "-f", filename, "-l", "en", "-nt", "-mc", "0", "-bs", "5",
-            "-otxt", "-of", out_txt[:-4], "--no-gpu"
-        ]
+        cmd_cpu = build_whisper_cmd(
+            exe,
+            MODEL_PATH,
+            filename,
+            base_args=["-l", "en", "-nt", "-mc", "0", "-bs", "5", "-otxt", "-of", out_txt[:-4], "--no-gpu"],
+        )
         res = subprocess.run(
             cmd_cpu,
             cwd=workdir,
@@ -719,7 +767,12 @@ def run_whisper(filename, bin_path):
 
     if not text and _looks_bad(res.stderr):
         safe_print("[whisper] bad-args fallback")
-        cmd_fallback = [bin_path, "-m", MODEL_PATH, "-f", filename, "-l", "en", "-nt", "-bs", "5", "-otxt", "-of", out_txt[:-4]]
+        cmd_fallback = build_whisper_cmd(
+            exe,
+            MODEL_PATH,
+            filename,
+            base_args=["-l", "en", "-nt", "-bs", "5", "-otxt", "-of", out_txt[:-4]],
+        )
         res = subprocess.run(
             cmd_fallback,
             cwd=workdir,
@@ -841,7 +894,8 @@ def self_test_jfk():
     if resolved_whisper_bin is None and not os.path.exists(WHISPER_BIN):
         notify("No whisper binary available for self-test")
         return
-    cmd = [(resolved_whisper_bin or WHISPER_BIN), "-m", MODEL_PATH, "-f", sample, "-nt"]
+    exe = os.path.abspath(_resolve_whisper_exe(resolved_whisper_bin or WHISPER_BIN))
+    cmd = build_whisper_cmd(exe, MODEL_PATH, sample, base_args=["-nt"]) 
     log_line("[self-test] running: " + " ".join(cmd))
     try:
         res = subprocess.run(cmd, capture_output=True, text=True, timeout=WHISPER_TIMEOUT_SEC)
@@ -871,7 +925,8 @@ def run_debug_probe():
     os.makedirs("debug", exist_ok=True)
     for bin_path in candidates:
         name = os.path.basename(bin_path)
-        cmd = [bin_path, "-m", MODEL_PATH, "-f", sample, "-nt"]
+        exe = os.path.abspath(_resolve_whisper_exe(bin_path))
+        cmd = build_whisper_cmd(exe, MODEL_PATH, sample, base_args=["-nt"]) 
         log_line(f"[debug] running: {' '.join(cmd)}")
         try:
             res = subprocess.run(cmd, capture_output=True, text=True, timeout=WHISPER_TIMEOUT_SEC)
