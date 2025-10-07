@@ -1,0 +1,49 @@
+@"
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.pytest_cache/
+
+# Secrets
+.env
+*.key
+*.pem
+
+# Build/Artifacts
+dist/
+build/
+*.log
+
+# Editors/OS
+.vscode/
+.idea/
+.DS_Store
+
+# Data/Models/Audio (don’t push these)
+data/
+datasets/
+models/
+checkpoints/
+*.pt
+*.bin
+*.onnx
+*.ckpt
+*.wav
+*.mp3
+*.flac
+*.mp4
+*.zip
+*.7z
+*.tar
+*.tar.gz
+"@ | Set-Content .gitignore
+
+# Local backup and binary junk
+.git.backup/
+.vs/
+*.exe
+*.dll
