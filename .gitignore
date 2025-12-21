@@ -1,29 +1,34 @@
-@"
-# Python
+## Python
 .venv/
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
+*.py[cod]
 *.egg-info/
 .pytest_cache/
 
-# Secrets
+## Secrets
 .env
 *.key
 *.pem
 
-# Build/Artifacts
+## Build/Artifacts
 dist/
 build/
 *.log
 
-# Editors/OS
+## Editors/OS
 .vscode/
 .idea/
+.vs/
 .DS_Store
 
-# Data/Models/Audio (don’t push these)
+## Local binaries (don’t commit compiled outputs)
+*.exe
+*.dll
+*.pdb
+*.lib
+*.exp
+
+## Data/Models/Audio (don’t push these)
 data/
 datasets/
 models/
@@ -40,10 +45,10 @@ checkpoints/
 *.7z
 *.tar
 *.tar.gz
-"@ | Set-Content .gitignore
 
-# Local backup and binary junk
+## Local run outputs
+whisper_stats.json
+flow_out.txt
+
+## Local backups
 .git.backup/
-.vs/
-*.exe
-*.dll
